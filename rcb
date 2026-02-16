@@ -1,0 +1,317 @@
+#!/usr/bin/env python3
+"""
+Resume Context Builder - Enhanced CLI
+
+Features:
+- Multiple context databases
+- Fixed file deletion
+- Information decay
+- Time range filtering
+"""
+
+import argparse
+import sys
+from pathlib import Path
+
+# Add parent to path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from kb.db_enhanced import (
+    list_context_databases,
+    delete_context_database,
+    apply_information_decay,
+    get_decay_log,
+    get_time_range,
+    DEFAULT_CONTEXT_DB,
+    get_engine,
+)
+from kb.upsert_enhanced import (
+    upsert_markdown_files,
+    delete_file_from_context,
+    list_files_in_context,
+)
+from kb.search_enhanced import search_with_time_filter
+
+
+def cmd_list_contexts(args):
+    """List all context databases."""
+    contexts = list_context_databases()
+    print("Available context databases:")
+    print("-" * 40)
+    for ctx in contexts:
+        marker = " *" if ctx == DEFAULT_CONTEXT_DB else ""
+        print(f"  - {ctx}{marker}")
+    if not contexts:
+        print("  (none found)")
+
+
+def cmd_create_context(args):
+    """Create a new context database."""
+    # Just initialize by getting engine
+    engine = get_engine(args.name)
+    print(f"Created context database: {args.name}")
+
+
+def cmd_delete_context(args):
+    """Delete a context database."""
+    if args.name == DEFAULT_CONTEXT_DB:
+        print(f"Error: Cannot delete default context '{DEFAULT_CONTEXT_DB}'")
+        sys.exit(1)
+    
+    if delete_context_database(args.name):
+        print(f"Deleted context database: {args.name}")
+    else:
+        print(f"Context not found: {args.name}")
+        sys.exit(1)
+
+
+def cmd_list_files(args):
+    """List files in a context."""
+    files = list_files_in_context(args.context)
+    print(f"Files in context '{args.context}':")
+    print("-" * 60)
+    if not files:
+        print("  (no files)")
+        return
+    for path, sha, updated in files:
+        print(f"  - {path}")
+        print(f"    Updated: {updated}")
+        print()
+
+
+def cmd_upsert(args):
+    """Upsert markdown files into a context."""
+    root = Path(args.dir).expanduser().resolve()
+    if not root.exists():
+        print(f"Error: Directory not found: {root}")
+        sys.exit(1)
+    
+    md_files = sorted(root.rglob("*.md"))
+    if not md_files:
+        print(f"No markdown files found in {root}")
+        sys.exit(0)
+    
+    print(f"Found {len(md_files)} markdown files")
+    print(f"Upserting into context: {args.context}")
+    print("-" * 40)
+    
+    def progress(current, total, path):
+        pct = (current / total) * 100
+        print(f"  [{pct:5.1f}%] {path.name}")
+    
+    count = upsert_markdown_files(
+        md_files,
+        context_db=args.context,
+        progress_cb=progress if args.verbose else None
+    )
+    
+    print("-" * 40)
+    print(f"Upserted {count} chunks from {len(md_files)} files")
+
+
+def cmd_delete_file(args):
+    """Delete a file from a context."""
+    deleted = delete_file_from_context(args.path, args.context)
+    print(f"Deleted {deleted} chunks from {args.path}")
+
+
+def cmd_decay(args):
+    """Apply information decay."""
+    engine = get_engine(args.context)
+    
+    print(f"Applying information decay ({args.days} days)")
+    print(f"Context: {args.context}")
+    if args.dry_run:
+        print("Mode: DRY RUN (no actual deletions)")
+    print("-" * 40)
+    
+    results = apply_information_decay(engine, max_age_days=args.days, dry_run=args.dry_run)
+    
+    print(f"  Chunks deleted:      {results['chunks']}")
+    print(f"  File index entries:  {results['file_index']}")
+    print(f"  Job runs deleted:    {results['job_runs']}")
+    print(f"  Feedback deleted:    {results['feedback']}")
+    
+    if args.dry_run:
+        print("\n(Dry run - nothing was actually deleted)")
+    else:
+        print("\nDecay applied successfully")
+
+
+def cmd_decay_log(args):
+    """Show decay operation history."""
+    engine = get_engine(args.context)
+    logs = get_decay_log(engine, limit=args.limit)
+    
+    print(f"Recent decay operations for '{args.context}':")
+    print("-" * 60)
+    
+    if not logs:
+        print("  (no decay operations recorded)")
+        return
+    
+    for action, details, executed_at in logs:
+        print(f"  [{executed_at}]")
+        print(f"  Action: {action}")
+        print(f"  Details: {details}")
+        print()
+
+
+def cmd_search(args):
+    """Search with time range filtering."""
+    print(f"Searching: '{args.query}'")
+    print(f"Context: {args.context}")
+    print(f"Time range: {args.time_range}")
+    print(f"Top-K: {args.top_k}")
+    print("-" * 60)
+    
+    results = search_with_time_filter(
+        args.query,
+        time_range=args.time_range,
+        top_k=args.top_k,
+        context_db=args.context
+    )
+    
+    if not results:
+        print("No results found")
+        return
+    
+    for i, (cid, score, path, cname, snippet, _) in enumerate(results, 1):
+        print(f"\n{i}. Score: {score:.4f} | Chunk: {cname}")
+        print(f"   Path: {path}")
+        print(f"   Snippet: {snippet[:200]}...")
+    
+    print(f"\nTotal: {len(results)} results")
+
+
+def cmd_time_range(args):
+    """Show time range conversion."""
+    since, until = get_time_range(args.range_str)
+    print(f"Time range: {args.range_str}")
+    print(f"  Since: {since or '(no limit)'}")
+    print(f"  Until: {until or '(now)'}")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Resume Context Builder - Enhanced CLI",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # List all context databases
+  %(prog)s contexts list
+  
+  # Create a new context
+  %(prog)s contexts create my-project
+  
+  # Upsert files into a context
+  %(prog)s upsert /path/to/markdown --context my-project
+  
+  # List files in a context
+  %(prog)s files list --context my-project
+  
+  # Delete a file from context
+  %(prog)s files delete /path/to/file.md --context my-project
+  
+  # Search with time filter (last 3 months)
+  %(prog)s search "python developer" --time-range 3m
+  
+  # Apply information decay (remove data older than 1 year)
+  %(prog)s decay 365 --dry-run
+  
+  # Delete an entire context
+  %(prog)s contexts delete my-project
+        """
+    )
+    
+    subparsers = parser.add_subparsers(dest="command", help="Commands")
+    
+    # Context commands
+    context_parser = subparsers.add_parser("contexts", help="Manage context databases")
+    context_sub = context_parser.add_subparsers(dest="context_cmd")
+    
+    context_list = context_sub.add_parser("list", help="List all contexts")
+    context_list.set_defaults(func=cmd_list_contexts)
+    
+    context_create = context_sub.add_parser("create", help="Create a new context")
+    context_create.add_argument("name", help="Context name")
+    context_create.set_defaults(func=cmd_create_context)
+    
+    context_delete = context_sub.add_parser("delete", help="Delete a context")
+    context_delete.add_argument("name", help="Context name")
+    context_delete.set_defaults(func=cmd_delete_context)
+    
+    # File commands
+    file_parser = subparsers.add_parser("files", help="Manage files in context")
+    file_sub = file_parser.add_subparsers(dest="file_cmd")
+    
+    file_list = file_sub.add_parser("list", help="List files in context")
+    file_list.add_argument("--context", "-c", default=DEFAULT_CONTEXT_DB, help="Context name")
+    file_list.set_defaults(func=cmd_list_files)
+    
+    file_delete = file_sub.add_parser("delete", help="Delete a file from context")
+    file_delete.add_argument("path", help="File path")
+    file_delete.add_argument("--context", "-c", default=DEFAULT_CONTEXT_DB, help="Context name")
+    file_delete.set_defaults(func=cmd_delete_file)
+    
+    # Upsert command
+    upsert_parser = subparsers.add_parser("upsert", help="Upsert markdown files")
+    upsert_parser.add_argument("dir", help="Directory containing markdown files")
+    upsert_parser.add_argument("--context", "-c", default=DEFAULT_CONTEXT_DB, help="Context name")
+    upsert_parser.add_argument("--verbose", "-v", action="store_true", help="Show progress")
+    upsert_parser.set_defaults(func=cmd_upsert)
+    
+    # Decay commands
+    decay_parser = subparsers.add_parser("decay", help="Information decay management")
+    decay_sub = decay_parser.add_subparsers(dest="decay_cmd")
+    
+    decay_apply = decay_sub.add_parser("apply", help="Apply decay (remove old data)")
+    decay_apply.add_argument("days", type=int, help="Maximum age in days")
+    decay_apply.add_argument("--context", "-c", default=DEFAULT_CONTEXT_DB, help="Context name")
+    decay_apply.add_argument("--dry-run", "-n", action="store_true", help="Show what would be deleted")
+    decay_apply.set_defaults(func=cmd_decay)
+    
+    decay_log = decay_sub.add_parser("log", help="Show decay history")
+    decay_log.add_argument("--context", "-c", default=DEFAULT_CONTEXT_DB, help="Context name")
+    decay_log.add_argument("--limit", "-l", type=int, default=10, help="Number of entries")
+    decay_log.set_defaults(func=cmd_decay_log)
+    
+    # Search command
+    search_parser = subparsers.add_parser("search", help="Search with time filtering")
+    search_parser.add_argument("query", help="Search query")
+    search_parser.add_argument("--context", "-c", default=DEFAULT_CONTEXT_DB, help="Context name")
+    search_parser.add_argument("--time-range", "-t", default="all",
+                               choices=["1d", "1w", "1m", "3m", "6m", "1y", "all"],
+                               help="Time range filter")
+    search_parser.add_argument("--top-k", "-k", type=int, default=5, help="Number of results")
+    search_parser.set_defaults(func=cmd_search)
+    
+    # Time range utility
+    time_parser = subparsers.add_parser("time-range", help="Show time range conversion")
+    time_parser.add_argument("range_str", help="Time range string (e.g., 1d, 3m, 1y)")
+    time_parser.set_defaults(func=cmd_time_range)
+    
+    args = parser.parse_args()
+    
+    if not args.command:
+        parser.print_help()
+        sys.exit(1)
+    
+    # Handle sub-subcommands
+    if args.command == "contexts" and not args.context_cmd:
+        context_parser.print_help()
+        sys.exit(1)
+    
+    if args.command == "files" and not args.file_cmd:
+        file_parser.print_help()
+        sys.exit(1)
+    
+    if args.command == "decay" and not args.decay_cmd:
+        decay_parser.print_help()
+        sys.exit(1)
+    
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
